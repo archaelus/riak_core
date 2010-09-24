@@ -10,7 +10,6 @@
              chash,
              gen_nb_server,
              gen_server2,
-             json_pp,
              merkerl,
              priority_queue,
              process_proxy,
