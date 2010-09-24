@@ -1,0 +1,5 @@
+*~
+*.beam
+.eunit/*
+include/riak_core_pb.hrl
+data/
