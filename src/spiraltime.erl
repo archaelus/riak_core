@@ -22,34 +22,42 @@
 
 %% @doc A set of sliding windows for recording N-per-second running stats.
 %%
-%% This keeps stats per second for the last minute, per minute for an hour,
-%% per hour for a day, and per day for a week.
+%% This keeps stats per second for the last minute.
 %%
-%% The goal is not to have "perfect" stats; post-fact log analysis is
-%% better for that.  The goal here is to have approximate running
-%% data useful for quick understanding of performance trends.
+%% See git commit history for versions of this module which keep stats
+%% for more than 1 minute.
 
 -module(spiraltime).
 -author('Justin Sheehy <justin@basho.com>').
+
+-ifdef(TEST).
+-ifdef(EQC).
+-include_lib("eqc/include/eqc.hrl").
+-endif.
+-include_lib("eunit/include/eunit.hrl").
+-endif.
+
 -export([fresh/0,fresh/1,n/0,incr/2,incr/3,
-         rep_second/1,rep_minute/1,rep_hour/1,rep_day/1,rep_week/1,
+         rep_second/1,rep_minute/1,
          test_spiraltime/0]).
+
+-export_type([spiral/0]).
 
 %% @type moment() = integer().
 %% This is a number of seconds, as produced by
-%% calendar:datetime_to_gregorian_seconds(calendar:universal_time())
+%% calendar:datetime_to_gregorian_seconds(calendar:local_time())
 
 %% @type count() = integer().
 %% The number of entries recorded in some time period.
 
 -record(spiral, {moment :: integer(),
-                 seconds :: [integer()],
-                 minutes :: [integer()],
-                 hours :: [integer()],
-                 days :: [integer()]}).
+                 seconds :: [integer()]
+                }).
+
+-type spiral() :: #spiral{}.
 
 n() ->
-    calendar:datetime_to_gregorian_seconds(calendar:universal_time()).
+    calendar:datetime_to_gregorian_seconds(calendar:local_time()).
 
 %% @doc Create an empty spiral with which to begin recording entries.
 %% @spec fresh() -> spiral()
@@ -60,20 +68,12 @@ fresh() ->
 %% @spec fresh(moment()) -> spiral()
 fresh(Moment) ->
     #spiral{moment=Moment,
-            seconds=[0 || _ <- lists:seq(1,60)],
-            minutes=[0 || _ <- lists:seq(1,60)],
-            hours=[0 || _ <- lists:seq(1,24)],
-            days=[0 || _ <- lists:seq(1,7)]}.
+            seconds=[0 || _ <- lists:seq(1,60)]
+           }.
 
-fieldlen(#spiral.seconds) -> 60;
-fieldlen(#spiral.minutes) -> 60;
-fieldlen(#spiral.hours)   -> 24;
-fieldlen(#spiral.days)    -> 7.
+fieldlen(#spiral.seconds) -> 60.
 
-nextfield(#spiral.seconds) -> #spiral.minutes;
-nextfield(#spiral.minutes) -> #spiral.hours;
-nextfield(#spiral.hours)   -> #spiral.days;
-nextfield(#spiral.days)    -> done.
+nextfield(#spiral.seconds) -> done.
 
 %% @doc Produce the number of entries recorded in the last second.
 %% @spec rep_second(spiral()) -> {moment(), count()}
@@ -86,24 +86,6 @@ rep_minute(Spiral) ->
     {Minute,_} = lists:split(60,Spiral#spiral.seconds),
     {Spiral#spiral.moment, lists:sum(Minute)}.
 
-%% @doc Produce the approximate number of entries recorded in the last hour.
-%% @spec rep_hour(spiral()) -> {moment(), count()}
-rep_hour(Spiral) ->
-    {Hour,_} = lists:split(60,Spiral#spiral.minutes),
-    {Spiral#spiral.moment, lists:sum(Hour)}.
-
-%% @doc Produce the approximate number of entries recorded in the last day.
-%% @spec rep_day(spiral()) -> {moment(), count()}
-rep_day(Spiral) ->
-    {Day,_} = lists:split(24,Spiral#spiral.hours),
-    {Spiral#spiral.moment, lists:sum(Day)}.
-
-%% @doc Produce the approximate number of entries recorded in the last week.
-%% @spec rep_week(spiral()) -> {moment(), count()}
-rep_week(Spiral) ->
-    {Week,_} = lists:split(7,Spiral#spiral.days),
-    {Spiral#spiral.moment, lists:sum(Week)}.
-
 %% @doc Add N to the counter of events, as recently as possible.
 %% @spec incr(count(), spiral()) -> spiral()
 incr(N, Spiral) -> incr(N,n(),Spiral).
@@ -114,7 +96,7 @@ incr(N, Moment, Spiral) when Spiral#spiral.moment =:= Moment ->
     % common case -- updates for "now"
     Spiral#spiral{seconds=[hd(Spiral#spiral.seconds)+N|
                            tl(Spiral#spiral.seconds)]};
-incr(_N, Moment, Spiral) when Spiral#spiral.moment - Moment > 60 ->
+incr(_N, Moment, Spiral) when Spiral#spiral.moment - Moment > 59 ->
     Spiral; % updates more than a minute old are dropped! whee!
 incr(N, Moment, Spiral) ->
     S1 = update_moment(Moment, Spiral),
@@ -155,4 +137,30 @@ test_spiraltime() ->
     S2 = incr(3, PlusOne, S1),
     {PlusOne, 3} = rep_second(S2),
     {PlusOne, 20} = rep_minute(S2),
+    %% Drops items 60 seconds or older
+    S2 = incr(1, PlusOne-60, S2),
     true.
+
+-ifdef(TEST).
+
+all_test() ->
+    true = test_spiraltime().
+
+-ifdef(EQC).
+
+prop_dontcrash() ->
+    ?FORALL(Mods, list({choose(0, 65), choose(-10, 10)}),
+            begin
+                Start = n(),
+                lists:foldl(fun({When, Amt}, Sp) ->
+                                    incr(Amt, Start + When, Sp)
+                            end, fresh(Start), Mods),
+                true
+            end).
+
+%% Don't run for now b/c it always times out
+%% eqc_test() ->
+%%     eqc:quickcheck(eqc:numtests(5*1000, prop_dontcrash())).
+
+-endif.
+-endif.

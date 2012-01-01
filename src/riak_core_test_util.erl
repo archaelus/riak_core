@@ -23,19 +23,27 @@
 %% @doc utilities for test scripts
 
 -module(riak_core_test_util).
+
+-ifdef(TEST).
 -export([setup_mockring1/0]).
 -include_lib("eunit/include/eunit.hrl").
 
 setup_mockring1() ->
     % requires a running riak_core_ring_manager, in test-mode is ok
-    Ring0 = lists:foldl(fun(_,R) ->
+    Ring0 = riak_core_ring:fresh(16,node()),
+    Ring1 = riak_core_ring:add_member(node(), Ring0, 'othernode@otherhost'),
+    Ring2 = riak_core_ring:add_member(node(), Ring1, 'othernode2@otherhost2'),
+
+    Ring3 = lists:foldl(fun(_,R) ->
                                riak_core_ring:transfer_node(
                                  hd(riak_core_ring:my_indices(R)),
-                                 othernode@otherhost, R) end,
-                       riak_core_ring:fresh(16,node()),[1,2,3,4,5,6]),
+                                 'othernode@otherhost', R) end,
+                        Ring2,[1,2,3,4,5,6]),
     Ring = lists:foldl(fun(_,R) ->
                                riak_core_ring:transfer_node(
                                  hd(riak_core_ring:my_indices(R)),
-                                 othernode2@otherhost2, R) end,
-                       Ring0,[1,2,3,4,5,6]),
-    riak_core_ring_manager:set_my_ring(Ring).
+                                 'othernode2@otherhost2', R) end,
+                       Ring3,[1,2,3,4,5,6]),
+    riak_core_ring_manager:set_ring_global(Ring).
+
+-endif. %TEST.

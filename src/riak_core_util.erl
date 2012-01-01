@@ -34,11 +34,18 @@
          chash_std_keyfun/1,
          chash_bucketonly_keyfun/1,
          mkclientid/1,
-         start_app_deps/1]).
+         start_app_deps/1,
+         build_tree/3,
+         rpc_every_member/4,
+         rpc_every_member_ann/4,
+         is_arch/1]).
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
 -endif.
+
+%% R14 Compatibility
+-compile({no_auto_import,[integer_to_list/2]}).
 
 %% ===================================================================
 %% Public API
@@ -210,13 +217,70 @@ ensure_started(App) ->
 	    ok
     end.
 
+%% @spec rpc_every_member(atom(), atom(), [term()], integer()|infinity)
+%%          -> {Results::[term()], BadNodes::[node()]}
+%% @doc Make an RPC call to the given module and function on each
+%%      member of the cluster.  See rpc:multicall/5 for a description
+%%      of the return value.
+rpc_every_member(Module, Function, Args, Timeout) ->
+    {ok, MyRing} = riak_core_ring_manager:get_my_ring(),
+    Nodes = riak_core_ring:all_members(MyRing),
+    rpc:multicall(Nodes, Module, Function, Args, Timeout).
+
+%% @doc Same as rpc_every_member/4, but annotate the result set with
+%%      the name of the node returning the result.
+-spec rpc_every_member_ann(module(), atom(), [term()], integer()|infinity)
+                          -> {Results::[{node(), term()}], Down::[node()]}.
+rpc_every_member_ann(Module, Function, Args, Timeout) ->
+    {ok, MyRing} = riak_core_ring_manager:get_my_ring(),
+    Nodes = riak_core_ring:all_members(MyRing),
+    {Results, Down} = rpc:multicall(Nodes, Module, Function, Args, Timeout),
+    Up = Nodes -- Down,
+    TaggedResults = lists:zip(Up, Results),
+    {TaggedResults, Down}.
+
+%% @doc Convert a list of elements into an N-ary tree. This conversion
+%%      works by treating the list as an array-based tree where, for
+%%      example in a binary 2-ary tree, a node at index i has children
+%%      2i and 2i+1. The conversion also supports a "cycles" mode where
+%%      the array is logically wrapped around to ensure leaf nodes also
+%%      have children by giving them backedges to other elements.
+-spec build_tree(N :: integer(), Nodes :: [term()], Opts :: [term()])
+                -> orddict:orddict(Node :: term(), Children :: [term()]).
+build_tree(N, Nodes, Opts) ->
+    case lists:member(cycles, Opts) of
+        true -> 
+            Expand = lists:flatten(lists:duplicate(N+1, Nodes));
+        false ->
+            Expand = Nodes
+    end,
+    {Tree, _} =
+        lists:foldl(fun(Elm, {Result, Worklist}) ->
+                            Len = erlang:min(N, length(Worklist)),
+                            {Children, Rest} = lists:split(Len, Worklist),
+                            NewResult = [{Elm, Children} | Result],
+                            {NewResult, Rest}
+                    end, {[], tl(Expand)}, Nodes),
+    orddict:from_list(Tree).
+
+%% Returns a forced-lowercase architecture for this node
+-spec get_arch () -> string().
+get_arch () -> string:to_lower(erlang:system_info(system_architecture)).
+
+%% Checks if this node is of a given architecture
+-spec is_arch (atom()) -> boolean().
+is_arch (linux) -> string:str(get_arch(),"linux") > 0;
+is_arch (darwin) -> string:str(get_arch(),"darwin") > 0;
+is_arch (sunos) -> string:str(get_arch(),"sunos") > 0;
+is_arch (osx) -> is_arch(darwin);
+is_arch (solaris) -> is_arch(sunos);
+is_arch (Arch) -> throw({unsupported_architecture,Arch}).
 
 %% ===================================================================
 %% EUnit tests
 %% ===================================================================
 -ifdef(TEST).
 
-%% @spec moment_test() -> boolean()
 moment_test() ->
     M1 = riak_core_util:moment(),
     M2 = riak_core_util:moment(),
@@ -225,6 +289,50 @@ moment_test() ->
 clientid_uniqueness_test() ->
     ClientIds = [mkclientid('somenode@somehost') || _I <- lists:seq(0, 10000)],
     length(ClientIds) =:= length(sets:to_list(sets:from_list(ClientIds))).
+
+build_tree_test() ->
+    Flat = [1,
+            11, 12,
+            111, 112, 121, 122,
+            1111, 1112, 1121, 1122, 1211, 1212, 1221, 1222],
+
+    %% 2-ary tree decomposition
+    ATree = [{1,    [  11,   12]},
+             {11,   [ 111,  112]},
+             {12,   [ 121,  122]},
+             {111,  [1111, 1112]},
+             {112,  [1121, 1122]},
+             {121,  [1211, 1212]},
+             {122,  [1221, 1222]},
+             {1111, []},
+             {1112, []},
+             {1121, []},
+             {1122, []},
+             {1211, []},
+             {1212, []},
+             {1221, []},
+             {1222, []}],
+
+    %% 2-ary tree decomposition with cyclic wrap-around
+    CTree = [{1,    [  11,   12]},
+             {11,   [ 111,  112]},
+             {12,   [ 121,  122]},
+             {111,  [1111, 1112]},
+             {112,  [1121, 1122]},
+             {121,  [1211, 1212]},
+             {122,  [1221, 1222]},
+             {1111, [   1,   11]},
+             {1112, [  12,  111]},
+             {1121, [ 112,  121]},
+             {1122, [ 122, 1111]},
+             {1211, [1112, 1121]},
+             {1212, [1122, 1211]},
+             {1221, [1212, 1221]},
+             {1222, [1222,    1]}],
+
+    ?assertEqual(ATree, build_tree(2, Flat, [])),
+    ?assertEqual(CTree, build_tree(2, Flat, [cycles])),
+    ok.
 
 -endif.
 

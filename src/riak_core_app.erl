@@ -32,6 +32,10 @@
 %% ===================================================================
 
 start(_StartType, _StartArgs) ->
+    %% Don't add our system_monitor event handler here.  Instead, let
+    %% riak_core_sysmon_minder start it, because that process can act
+    %% on any handler crash notification, whereas we cannot.
+
     %% Validate that the ring state directory exists
     riak_core_util:start_app_deps(riak_core),
     RingStateDir = app_helper:get_env(riak_core, ring_state_dir),
@@ -39,28 +43,51 @@ start(_StartType, _StartArgs) ->
         ok ->
             ok;
         {error, RingReason} ->
-            error_logger:error_msg(
+            lager:critical(
               "Ring state directory ~p does not exist, "
-              "and could not be created. (reason: ~p)\n",
-              [RingStateDir, RingReason]),
+              "and could not be created: ~p",
+              [RingStateDir, lager:posix_error(RingReason)]),
             throw({error, invalid_ring_state_dir})
     end,
+
+    %% Register our cluster_info app callback modules, with catch if
+    %% the app is missing or packaging is broken.
+    catch cluster_info:register_app(riak_core_cinfo_core),
+
+    %% add these defaults now to supplement the set that may have been
+    %% configured in app.config
+    riak_core_bucket:append_bucket_defaults(
+      [{n_val,3},
+       {allow_mult,false},
+       {last_write_wins,false},
+       {precommit, []},
+       {postcommit, []},
+       {chash_keyfun, {riak_core_util, chash_std_keyfun}}]),
 
     %% Spin up the supervisor; prune ring files as necessary
     case riak_core_sup:start_link() of
         {ok, Pid} ->
-            ok = riak_core_ring_events:add_handler(riak_core_ring_handler, []),
+            ok = riak_core_ring_events:add_guarded_handler(riak_core_ring_handler, []),
             %% App is running; search for latest ring file and initialize with it
             riak_core_ring_manager:prune_ringfiles(),
             case riak_core_ring_manager:find_latest_ringfile() of
                 {ok, RingFile} ->
-                    Ring = riak_core_ring_manager:read_ringfile(RingFile),
-                    riak_core_ring_manager:set_my_ring(Ring);
+                    case riak_core_ring_manager:read_ringfile(RingFile) of
+                        {error, Reason} ->
+                            lager:critical("Failed to read ring file: ~p",
+                                [lager:posix_error(Reason)]),
+                            throw({error, Reason});
+                        Ring0 ->
+                            %% Upgrade the ring data structure if necessary.
+                            Ring = riak_core_ring:upgrade(Ring0),
+                            riak_core_ring_manager:set_my_ring(Ring)
+                    end;
                 {error, not_found} ->
-                    error_logger:warning_msg("No ring file available.\n");
+                    riak_core_ring_manager:write_ringfile(),
+                    lager:warning("No ring file available.");
                 {error, Reason} ->
-                    error_logger:error_msg("Failed to load ring file: ~p\n",
-                                           [Reason]),
+                    lager:critical("Failed to load ring file: ~p",
+                        [lager:posix_error(Reason)]),
                     throw({error, Reason})
             end,
             {ok, Pid};

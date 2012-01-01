@@ -1,6 +1,6 @@
 
 
-.PHONY: deps
+.PHONY: deps test
 
 all: deps compile
 
@@ -16,14 +16,11 @@ clean:
 distclean: clean 
 	./rebar delete-deps
 
-eunit:
+test: all
 	./rebar skip_deps=true eunit
 
-docs:
+docs: deps
 	./rebar skip_deps=true doc
-	@cp -R apps/luke/doc doc/luke
-	@cp -R apps/riak_core/doc doc/riak_core
-	@cp -R apps/riak_kv/doc doc/riak_kv
 
 dialyzer: compile
 	@dialyzer -Wno_return -c apps/riak_core/ebin

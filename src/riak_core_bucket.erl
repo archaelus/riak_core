@@ -28,34 +28,58 @@
 -export([append_bucket_defaults/1,
          set_bucket/2,
          get_bucket/1,
-         get_bucket/2]).
+         get_bucket/2,
+         merge_props/2]).
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
 -endif.
 
-%% @doc Add a list of defaults to global list of defaults for new buckets.
+%% @doc Add a list of defaults to global list of defaults for new
+%%      buckets.  If any item is in Items is already set in the
+%%      current defaults list, the new setting is omitted, and the old
+%%      setting is kept.  Omitting the new setting is intended
+%%      behavior, to allow settings from app.config to override any
+%%      hard-coded values.
 append_bucket_defaults(Items) when is_list(Items) ->
-    NewDefaults = app_helper:get_env(riak_core, default_bucket_props) ++ Items,
-    application:set_env(riak_core, default_bucket_props, NewDefaults).
+    OldDefaults = app_helper:get_env(riak_core, default_bucket_props, []),
+    NewDefaults = merge_props(OldDefaults, Items),
+    FixedDefaults = case riak_core:bucket_fixups() of
+        [] -> NewDefaults;
+        Fixups ->
+            riak_core_ring_manager:run_fixups(Fixups, default, NewDefaults)
+    end,
+    application:set_env(riak_core, default_bucket_props, FixedDefaults),
+    %% do a noop transform on the ring, to make the fixups re-run
+    catch(riak_core_ring_manager:ring_trans(fun(Ring, _) ->
+                    {new_ring, Ring} end, undefined)).
 
 
 %% @spec set_bucket(riak_object:bucket(), BucketProps::riak_core_bucketprops()) -> ok
 %% @doc Set the given BucketProps in Bucket.
-set_bucket(Name, BucketProps) ->
-    F = fun(Ring, _Args) ->
-            OldBucket = get_bucket(Name),
-            NewKeys = proplists:get_keys(BucketProps),
-            PrunedOld = [{K,V} || {K,V} <- OldBucket, 
-                                  not lists:member(K,NewKeys)],
-            {new_ring, riak_core_ring:update_meta({bucket,Name},
-                                                  BucketProps ++ PrunedOld,
-                                                  Ring)}
-        end,
-    riak_core_ring_manager:ring_trans(F, undefined),
-    riak_core_ring_manager:write_ringfile(),
-    ok.
+set_bucket(Name, BucketProps0) ->
+    case validate_props(BucketProps0, riak_core:bucket_validators(), []) of
+        {ok, BucketProps} ->
+            F = fun(Ring, _Args) ->
+                        OldBucket = get_bucket(Name),
+                        NewBucket = merge_props(BucketProps, OldBucket),
+                        {new_ring, riak_core_ring:update_meta({bucket,Name},
+                                                              NewBucket,
+                                                              Ring)}
+                end,
+            {ok, _NewRing} = riak_core_ring_manager:ring_trans(F, undefined),
+            ok;
+        {error, Details} ->
+            lager:error("Bucket validation failed ~p~n", [Details]),
+            {error, Details}
+    end.
 
+%% @spec merge_props(list(), list()) -> list()
+%% @doc Merge two sets of bucket props.  If duplicates exist, the
+%%      entries in Overriding are chosen before those in Other.
+merge_props(Overriding, Other) ->
+    lists:ukeymerge(1, lists:ukeysort(1, Overriding),
+                    lists:ukeysort(1, Other)).
 
 %% @spec get_bucket(riak_object:bucket()) ->
 %%         {ok, BucketProps :: riak_core_bucketprops()}
@@ -83,6 +107,19 @@ get_bucket(Name, Ring) ->
         {ok, Bucket} -> Bucket
     end.
 
+%% @private
+-spec validate_props(BucketProps::list({PropName::atom(), Value::any()}),
+                     Validators::list(module()),
+                     Errors::list({PropName::atom(), Error::atom()})) ->
+                            {ok, BucketProps::list({PropName::atom(), Value::any()})} |
+                            {error,  Errors::list({PropName::atom(), Error::atom()})}.
+validate_props(BucketProps, [], []) ->
+    {ok, BucketProps};
+validate_props(_, [], Errors) ->
+    {error, Errors};
+validate_props(BucketProps0, [{_App, Validator}|T], Errors0) ->
+    {BucketProps, Errors} = Validator:validate(BucketProps0),
+    validate_props(BucketProps, T, lists:flatten([Errors|Errors0])).
 
 %% ===================================================================
 %% EUnit tests
@@ -91,6 +128,11 @@ get_bucket(Name, Ring) ->
 
 simple_set_test() ->
     application:load(riak_core),
+    %% appending an empty list of defaults makes up for the fact that
+    %% riak_core_app:start/2 is not called during eunit runs
+    %% (that's where the usual defaults are set at startup),
+    %% while also not adding any trash that might affect other tests
+    append_bucket_defaults([]),
     riak_core_ring_events:start_link(),
     riak_core_ring_manager:start_link(test),
     ok = set_bucket(a_bucket,[{key,value}]),
